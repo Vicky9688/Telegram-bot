@@ -1,0 +1,40 @@
+version: "3.9"
+
+services:
+  # ── Ollama — Local LLM server ──────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: avivo_ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    restart: unless-stopped
+    # GPU support (uncomment if you have NVIDIA GPU + nvidia-container-toolkit)
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+  # ── AVIVO Telegram Bot ─────────────────────────────
+  bot:
+    build: .
+    container_name: avivo_bot
+    depends_on:
+      - ollama
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - OLLAMA_HOST=http://ollama:11434   # Internal Docker network
+    volumes:
+      - ./rag/docs:/app/rag/docs          # Mount knowledge base docs
+      - bot_data:/app/data                # Persist SQLite DBs
+    restart: unless-stopped
+    command: >
+      sh -c "python setup.py && python app.py"
+
+volumes:
+  ollama_data:
+  bot_data:

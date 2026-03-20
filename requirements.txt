@@ -1,0 +1,15 @@
+# Core bot
+python-telegram-bot==21.5
+
+# RAG — Embeddings
+sentence-transformers==5.3.0
+numpy==2.4.3
+
+# Vision — Image Captioning
+transformers==5.3.0
+Pillow==10.4.0
+torch==2.10.0         # CPU-only; use torch==2.3.1+cu118 for CUDA
+
+# Utilities
+requests==2.32.3     # Ollama API calls
+python-dotenv==1.0.1 # Load .env file for local development
