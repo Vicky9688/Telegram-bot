@@ -1,116 +1,100 @@
 """
 vision/captioner.py
 Generates a caption + keyword tags for an uploaded image.
-Model: LLaVA via Ollama (local)
-  — Multimodal LLM: understands both text and images.
-  — Runs locally via Ollama — no GPU required (CPU supported).
-  — Much richer, more descriptive captions than BLIP.
-  — Same Ollama server already used for RAG pipeline.
+Model: Salesforce/blip-image-captioning-base
+  — Lightweight (~900MB), runs on CPU, no GPU required.
+  — Good accuracy for general scene understanding.
+  — Alternative: llava via Ollama for richer descriptions.
 """
 
 import re
-import base64
-import requests
-import os
 from pathlib import Path
+from PIL import Image
+from transformers import BlipProcessor, BlipForConditionalGeneration
+import torch
 
-OLLAMA_HOST  = os.getenv("OLLAMA_HOST", "http://localhost:11434")
-OLLAMA_URL   = f"{OLLAMA_HOST}/api/generate"
-VISION_MODEL = os.getenv("VISION_MODEL", "llava")
+MODEL_NAME = "Salesforce/blip-image-captioning-base"
+
+_processor = None
+_model = None
 
 
-def image_to_base64(image_path: str) -> str:
-    """Convert image file to base64 string for Ollama API."""
-    with open(image_path, "rb") as f:
-        return base64.b64encode(f.read()).decode("utf-8")
+def load_model():
+    """Lazy-load BLIP model (only on first call)."""
+    global _processor, _model
+    if _processor is None:
+        print(f"[Vision] Loading model: {MODEL_NAME}")
+        _processor = BlipProcessor.from_pretrained(MODEL_NAME)
+        _model = BlipForConditionalGeneration.from_pretrained(
+            MODEL_NAME, torch_dtype=torch.float32
+        )
+        _model.eval()
+        print("[Vision] Model loaded.")
 
 
 def generate_caption(image_path: str) -> str:
-    """Generate a descriptive caption using LLaVA via Ollama."""
-    image_b64 = image_to_base64(image_path)
+    """Generate a descriptive caption for the image."""
+    load_model()
+    image = Image.open(image_path).convert("RGB")
 
-    payload = {
-        "model": VISION_MODEL,
-        "prompt": (
-            "Describe this image in one clear sentence. "
-            "Focus on the main subject, setting, and any important details."
-        ),
-        "images": [image_b64],
-        "stream": False,
-        "options": {
-            "temperature": 0.3,
-            "num_predict": 80,   # Short caption
-            "num_thread": 8,     # Use all CPU threads
-        },
+    # Conditional captioning (steered) for richer descriptions
+    text_prompt = "a photograph of"
+    inputs = _processor(image, text_prompt, return_tensors="pt")
+
+    with torch.no_grad():
+        output = _model.generate(
+            **inputs,
+            max_new_tokens=60,
+            num_beams=5,          # Beam search for better quality
+            early_stopping=True,
+        )
+
+    caption = _processor.decode(output[0], skip_special_tokens=True)
+    return caption.strip()
+
+
+def extract_tags(caption: str) -> list[str]:
+    """
+    Extract 3 keyword tags from the caption using simple NLP heuristics.
+    Avoids dependency on spaCy/NLTK for lighter footprint.
+    """
+    # Remove common stopwords
+    stopwords = {
+        "a", "an", "the", "is", "are", "of", "in", "on", "at", "to",
+        "and", "or", "with", "for", "it", "this", "that", "photograph",
+        "image", "photo", "picture", "showing", "there", "some", "has",
     }
 
-    try:
-        response = requests.post(OLLAMA_URL, json=payload, timeout=300)
-        response.raise_for_status()
-        return response.json().get("response", "").strip()
-    except requests.exceptions.ConnectionError:
-        raise RuntimeError("Cannot connect to Ollama. Make sure it's running.")
-    except requests.exceptions.Timeout:
-        raise RuntimeError("LLaVA timed out on CPU. Please try again.")
+    words = re.findall(r'\b[a-zA-Z]{3,}\b', caption.lower())
+    filtered = [w for w in words if w not in stopwords]
 
+    # Deduplicate while preserving order
+    seen = set()
+    unique = []
+    for w in filtered:
+        if w not in seen:
+            seen.add(w)
+            unique.append(w)
 
-def generate_tags(image_path: str) -> list[str]:
-    """Generate exactly 3 keyword tags using LLaVA."""
-    image_b64 = image_to_base64(image_path)
-
-    payload = {
-        "model": VISION_MODEL,
-        "prompt": (
-            "List exactly 3 single-word keywords that best describe this image. "
-            "Reply with ONLY the 3 words separated by commas. "
-            "Example format: cat, outdoor, sunny"
-        ),
-        "images": [image_b64],
-        "stream": False,
-        "options": {
-            "temperature": 0.1,
-            "num_predict": 20,
-            "num_thread": 8,
-        },
-    }
-
-    try:
-        response = requests.post(OLLAMA_URL, json=payload, timeout=300)
-        response.raise_for_status()
-        raw = response.json().get("response", "").strip()
-
-        # Parse comma-separated tags
-        tags = [t.strip().lower() for t in raw.split(",")]
-        # Clean non-alphabetic characters
-        tags = [re.sub(r"[^a-zA-Z]", "", t) for t in tags]
-        # Filter empty and return top 3
-        tags = [t for t in tags if t][:3]
-
-        # Fallback if parsing fails
-        if not tags:
-            tags = ["image", "photo", "visual"]
-
-        return tags
-
-    except Exception:
-        return ["image", "photo", "visual"]
+    # Return top 3 (first meaningful words tend to be most descriptive)
+    return unique[:3] if len(unique) >= 3 else unique
 
 
 def describe_image(image_path: str) -> dict:
     """
     Full vision pipeline:
-    1. Generate rich caption using LLaVA
-    2. Generate 3 keyword tags using LLaVA
+    1. Generate caption using BLIP
+    2. Extract 3 keyword tags
     3. Return structured result
     """
     if not Path(image_path).exists():
         raise FileNotFoundError(f"Image not found: {image_path}")
 
     caption = generate_caption(image_path)
-    tags    = generate_tags(image_path)
+    tags = extract_tags(caption)
 
     return {
         "caption": caption,
-        "tags":    tags,
-        "model":   VISION_MODEL,
+        "tags": tags,
+        "model": MODEL_NAME,
     }
